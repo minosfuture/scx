@@ -259,6 +259,46 @@ struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
 }
 
 /*
+ * Intercept when a task is executing sched_setaffinity().
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, 1024);
+} pid_setaffinity_map SEC(".maps");
+
+SEC("kprobe/sched_setaffinity")
+int BPF_KPROBE(kprobe_sched_setaffinity, struct task_struct *task,
+			const struct cpumask *new_mask)
+{
+	pid_t pid = bpf_get_current_pid_tgid() >> 32;
+	u64 value = true;
+
+	bpf_map_update_elem(&pid_setaffinity_map, &pid, &value, BPF_ANY);
+
+	return 0;
+}
+
+SEC("kretprobe/sched_setaffinity")
+int BPF_KRETPROBE(kretprobe_sched_setaffinity)
+{
+	pid_t pid = bpf_get_current_pid_tgid() >> 32;
+	bpf_map_delete_elem(&pid_setaffinity_map, &pid);
+
+	return 0;
+}
+
+/*
+ * Return true if a task is executing sched_setaffinity(), false otherwise.
+ */
+static bool in_setaffinity(pid_t pid)
+{
+	u64 *value = bpf_map_lookup_elem(&pid_setaffinity_map, &pid);
+	return value != NULL;
+}
+
+/*
  * Return true if interactive tasks classification via voluntary context
  * switches is enabled, false otherwise.
  */
@@ -466,6 +506,14 @@ static int dispatch_direct_cpu(struct task_struct *p, s32 cpu, u64 enq_flags)
 			      p->pid, p->comm, cpu);
 		return -EINVAL;
 	}
+
+	/*
+	 * Prevent to dispatch tasks that are currently executing
+	 * sched_setaffinity() to a per-CPU DSQ, otherwise we may introduce
+	 * stalls in the DSQ.
+	 */
+	if (in_setaffinity(p->pid))
+		return -EINVAL;
 
 	scx_bpf_dispatch_vtime(p, dsq_id, SCX_SLICE_DFL, deadline, enq_flags);
 
